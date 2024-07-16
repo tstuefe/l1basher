@@ -9,10 +9,14 @@
 
 // Default: touch every cache line once in a 32K 8-way cache
 static int num_lines = 64 * 8;
+static int num_lines_skip = 0;
 static int seconds = -1; // infinite
 static int randomized = 0;
 static int verbose = 0;
 static int num_threads = 1;
+static int wait_before_exit = 0;
+
+static const size_t cacheline_size = 64;
 
 #define PRINT(...) 	{ printf(__VA_ARGS__); putc('\n', stdout); fflush(stdout); }
 #define ERRPRINT(...) 	{ fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); fflush(stderr); }
@@ -20,23 +24,51 @@ static int num_threads = 1;
 
 #define ERRBYE(...) { ERRPRINT(__VA_ARGS__); exit(-1); }
 
-#define USAGE "Usage: l1-basher [-d <secs>] [-T <threads>] [-n <cachelines>] [-v]"
+#define USAGE "Usage: l1-basher [-d <secs>] [-T <threads>] [-n <cachelines>] [--skip-lines <skip cachelines when touching>] [-v] [-w|--wait-before-exit]"
 
 #define EXPECT(cond, s) if (!(cond)) { ERRBYE(s); }
-
-struct cacheline {
-	unsigned char c[64];
-};
 
 struct thread_data {
 	pthread_t tid;
 	unsigned long long iterations;
 	unsigned long long useless;
 	volatile int stop;
-	struct cacheline* lines;
+	unsigned char* memory;
 };
 
-volatile int iii = 0;
+static void print_stats() {
+	FILE* f = fopen("/proc/self/status", "r");
+  	char line[1024];
+  	while (fgets(line, sizeof(line), f) == line) {
+    		line[sizeof(line) - 1] = '\0';
+		if (strstr(line, "ctx") != NULL) {
+			printf("%s", line);
+		}
+	}
+	fclose(f);
+}
+
+// In verbose mode, print rhythmic cadence once to ease understanding and to make sure we did not make errors.
+static void print_cadence(struct thread_data* td) {
+	const size_t distance = cacheline_size + (num_lines_skip * cacheline_size);
+	const size_t total_size = num_lines * cacheline_size;
+	PRINT("Thread %u will touch, in sequence: ", (unsigned)td->tid);
+	int zeros = 0;
+	const unsigned char* last = NULL;
+	for (int i = 0; zeros < 2 && i < 8; i ++) {
+		const size_t offset = (i * distance) % total_size;
+		const unsigned char* address = td->memory + offset;
+		printf("%p ", address);
+		if (last != NULL && last < address) {
+			printf("(+0x%x) ", (unsigned)(address - last));
+		}
+		last = address;
+		if (offset == 0) {
+			zeros ++;
+		}
+	}
+	printf(" ...\n");
+}
 
 static void* do_work(void* data) {
 
@@ -46,11 +78,15 @@ static void* do_work(void* data) {
 
 	const int stop_check_interval = 0x100000;
 
+	const size_t distance = cacheline_size + (num_lines_skip * cacheline_size);
+	const size_t total_size = num_lines * cacheline_size;
+
 	while(td->stop == 0) {
 		for (int i = 0; i < stop_check_interval; i ++) {
-			int cacheline_no = i % num_lines;
+			const size_t offset = (i * distance) % total_size;
+			const unsigned char* address = td->memory + offset;
 			// read access
-			useless += td->lines[cacheline_no].c[0];
+			useless += *(address);
 		}
 		iterations ++;
 	}
@@ -67,6 +103,9 @@ static void create_thread_and_run(struct thread_data* data) {
 	rc = pthread_create(&(data->tid), &attr, do_work, data);
 	if (rc == 0) {
 		VERBOSE("started thread %u", (unsigned)(data->tid));
+		if (verbose) {
+			print_cadence(data);
+		}
 	} else {
 		ERRBYE("thread start failure %d", errno);
 	}
@@ -92,10 +131,19 @@ int main(int argc, char** argv) {
                         EXPECT(a < argc, USAGE);
                         num_lines = atoi(argv[a]);
                         EXPECT(num_lines > 0, USAGE);
+		} else if (strcmp(argv[a], "--skip-lines") == 0) {
+                        a ++;
+                        EXPECT(a < argc, USAGE);
+                        num_lines_skip = atoi(argv[a]);
+                        EXPECT(num_lines_skip > 0, USAGE);
+                        EXPECT(num_lines_skip % 2 == 1 && num_lines_skip < num_lines ,
+                               "--skip-lines should be an uneven number smaller than number of cache lines");
 		} else if (strcmp(argv[a], "-r") == 0) {
 		 	randomized = 1;
 		} else if (strcmp(argv[a], "-v") == 0) {
 			verbose = 1;
+		} else if (strcmp(argv[a], "-w") == 0) {
+			wait_before_exit = 1;
 		} else {
 			ERRBYE(USAGE);
 		}
@@ -106,19 +154,20 @@ int main(int argc, char** argv) {
 
 	struct thread_data* tdarr = calloc(num_threads, sizeof(struct thread_data));
 
-	PRINT("Bashing %d lines with %d threads, randomized:%d ...", num_lines, num_threads, randomized);
+	PRINT("Bashing %d lines, skip %d, with %d threads, randomized:%d ...", num_lines, num_lines_skip, num_threads, randomized);
+	PRINT("My PID is %u.", getpid());
 
 	for (int t = 0; t < num_threads; t++) {
+		const size_t total_size = num_lines * cacheline_size;
 		void* mem = NULL;
-		if (posix_memalign(&mem, 64, num_lines * sizeof(struct cacheline)) != 0) {
+		if (posix_memalign(&mem, 64, total_size) != 0) {
 			ERRBYE("posix_memalign");
 		}
-		tdarr[t].lines = (struct cacheline*) mem;
+		tdarr[t].memory = (unsigned char*) mem;
 		// fill with upredictable data
 		time_t t1;
 		time(&t1);
-		memset(mem, (unsigned char)t1 & 0xFF, num_lines * sizeof(struct cacheline));
-		VERBOSE("mem @ %p", mem);
+		memset(mem, (unsigned char)t1 & 0xFF, total_size);
 	}
 
 	for (int t = 0; t < num_threads; t++) {
@@ -154,6 +203,13 @@ int main(int argc, char** argv) {
 	
 	PRINT("All Iterations: %llu (%.2f mio)", iterations, (double)iterations / 1000000.0f);
 	VERBOSE("useless: %d", useless);
+
+	print_stats();
+
+	if (wait_before_exit) {
+		PRINT("Finished, press key to exit process...");
+		getchar();
+	}
 
 	return 0;	
 }
